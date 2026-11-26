@@ -35,7 +35,7 @@ local canFile = false
 -- CONFIG
 --==================================================
 local C = {}
-C.BASE_URL = "https://raw.githubusercontent.com/X-Force-Egg/EggScanner/main/"
+C.BASE_URL = "https://raw.githubusercontent.com/X-Force-Egg/EggScaner/main/"
 C.UI_FILE = "EggHunterHub_UI.lua"
 C.AUTO_REFRESH_SECONDS = 4
 C.FAST_RETRY_SECONDS = 1.5
@@ -65,7 +65,7 @@ C.FILL_WAIT_MAX = 55                -- espera más después de la renovación
 C.FILL_STABLE_SECONDS = 8
 
 -- Salto de servidor
-C.SCRIPT_URL = "https://raw.githubusercontent.com/X-Force-Egg/EggScanner/main/EggHunterHub.lua"
+C.SCRIPT_URL = "https://raw.githubusercontent.com/X-Force-Egg/EggScaner/main/EggHunterHub.lua"
 C.HOP_DELAY_SECONDS = 6
 C.SCAN_TIMEOUT = 25
 C.RARE_MIN_VALUE = 0
