@@ -29,7 +29,7 @@ local TeleportService = game:GetService("TeleportService")
 local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
-local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+local canFile = false
 
 --==================================================
 -- CONFIG
