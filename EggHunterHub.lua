@@ -35,7 +35,7 @@ local canFile = type(writefile) == "function" and type(readfile) == "function" a
 -- CONFIG
 --==================================================
 local C = {}
-C.BASE_URL = C.BASE_URL = "https://raw.githubusercontent.com/X-Force-Egg/EggScanner/main/"
+C.BASE_URL = "https://raw.githubusercontent.com/X-Force-Egg/EggScanner/main/"
 C.UI_FILE = "EggHunterHub_UI.lua"
 C.AUTO_REFRESH_SECONDS = 4
 C.FAST_RETRY_SECONDS = 1.5
