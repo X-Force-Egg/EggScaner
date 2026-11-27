@@ -9,14 +9,16 @@
       Tamaño <= 5 -> Tamaño ^ 1.85
       Tamaño >  5 -> (Tamaño / 5) ^ 1.2 * 19.637875755794113
 
-    MODO CACERÍA (v3):
-      - Raro CONFIRMADO (2 escaneos seguidos) → avisa a Discord y salta.
+    MODO CACERÍA (v3.2):
+      - Raro CONFIRMADO (2 escaneos seguidos) → avisa al radar y salta.
       - Sin raro y HOP_WHEN_DRY = true → salta rápido a otro servidor
         (solo dentro de la ventana de búsqueda). Con false, se queda quieto.
       - Ventana de búsqueda ~4 minutos (235s) tras cada renovación.
       - Salto rápido (3s + 0-2s de jitter aleatorio).
       - Sistema de "Claim": evita que dos bots entren al mismo servidor.
-        (v3.1) Un solo pedido /api/claim/pick reserva el primer servidor libre de una lista.
+        Un solo pedido /api/claim/pick reserva el primer servidor libre de una lista.
+        (v3.2) Si el servidor ya se reservó en el pick, al llegar no se vuelve a reservar
+        (menos peticiones y menos escrituras en la base de datos del Worker).
       - Si el bot queda SOLO con un raro, se queda (HOLD_IF_ALONE) para que el link siga vivo.
       - Cada aviso lleva el link de unión correcto (joinUrl + deepLink).
 ]]
@@ -110,7 +112,7 @@ C.DRY_SCANS_NEEDED = 2
 C.CLAIM_ENABLED = true
 C.CLAIM_TTL = 360
 C.AUTO_DISMISS_ERRORS = true -- cierra solo el cartel "Teleport Failed" (error 769 y similares)
-C.PICK_ENABLED = true   -- reserva por lote (necesita Worker v9.2)
+C.PICK_ENABLED = true   -- reserva por lote (necesita Worker v9.2 o superior)
 C.PICK_BATCH = 25       -- candidatos que se mandan al Worker por salto
 C.HOLD_IF_ALONE = true  -- raro + solo en el servidor = no saltar (si no, el servidor se cierra y el link muere)
 
@@ -124,14 +126,14 @@ C.MIN_NEW_FOR_SAMPLE = 10
 C.CYCLE_RESET = false
 C.CYCLE_DEBUG = false
 
--- Discord
+-- Radar (Worker)
 C.RELAY_URL = "https://egg-radar.danielgamas83.workers.dev"
 C.RELAY_KEY = "Adrian2230@"
 C.NOTIFY_RARITIES = { Secret = true, Eternal = true, Divine = true }
 C.MIN_NOTIFY_VALUE = 300e6
 
 C.RELAY_KEY_MISSING = C.RELAY_URL ~= "" and C.RELAY_KEY == ""
-C.DISCORD_CONFIGURED = C.RELAY_URL ~= "" and not C.RELAY_KEY_MISSING
+C.RELAY_CONFIGURED = C.RELAY_URL ~= "" and not C.RELAY_KEY_MISSING
 
 C.DEFAULT_PRICE = 10
 C.SCALE_THRESHOLD = 5
@@ -185,7 +187,7 @@ local UI = buildUI({
 local THEME, RARITIES, UNKNOWN_RARITY = UI.THEME, UI.RARITIES, UI.UNKNOWN_RARITY
 
 if C.RELAY_KEY_MISSING then
-	warn("[EggHunter] Falta RELAY_KEY: los avisos a Discord están desactivados.")
+	warn("[EggHunter] Falta RELAY_KEY: los avisos al radar están desactivados.")
 end
 
 --==================================================
@@ -337,7 +339,7 @@ for _, s in ipairs(SORTS) do s.compare = byField(s.field) end
 --==================================================
 local eggs, sortIndex = {}, 1
 local isLoading, autoRefresh = false, true
-local discordOn = C.DISCORD_CONFIGURED
+local radarOn = C.RELAY_CONFIGURED
 _G.EggHunterSent = _G.EggHunterSent or {}
 local sentUids, sending = _G.EggHunterSent, false
 local INSTANCE_ID = {}
@@ -362,8 +364,8 @@ local scanDelay = C.AUTO_REFRESH_SECONDS
 local failStreak = 0
 
 local lastScanMsg = "Preparando..."
-local discordStatus, discordStatusUntil = "", 0
-local discordBlockedUntil = 0
+local radarStatus, radarStatusUntil = "", 0
+local radarBlockedUntil = 0
 
 local rareConfirmCount = 0
 local dryCount = 0
@@ -371,21 +373,21 @@ local confirmedScanRevision = -1
 local scanRevision = 0
 
 local function refreshSubtitle()
-	if discordStatus ~= "" and os.clock() < discordStatusUntil then
-		UI.setSubtitle(discordStatus)
+	if radarStatus ~= "" and os.clock() < radarStatusUntil then
+		UI.setSubtitle(radarStatus)
 	else
 		UI.setSubtitle(lastScanMsg)
 	end
 end
 
-local function setDiscordStatus(text, seconds)
-	discordStatus = text
-	discordStatusUntil = os.clock() + seconds
+local function setRadarStatus(text, seconds)
+	radarStatus = text
+	radarStatusUntil = os.clock() + seconds
 	refreshSubtitle()
 end
 
 if C.RELAY_KEY_MISSING then
-	setDiscordStatus("Discord apagado: falta RELAY_KEY", 60)
+	setRadarStatus("Radar apagado: falta RELAY_KEY", 60)
 end
 
 local httpRequest = request or http_request or (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request)
@@ -654,7 +656,7 @@ function commitEggs(list)
 end
 
 --==================================================
--- DISCORD
+-- RADAR (AVISOS AL WORKER)
 --==================================================
 local function post(url, payload)
 	local ok, res = pcall(httpRequest, {
@@ -671,7 +673,7 @@ local function post(url, payload)
 end
 
 -- Links para entrar a ESTE servidor exacto.
--- web  : abre Roblox y entra a la instancia (el que funciona en navegador/Discord)
+-- web  : link web de Roblox (el Worker lo convierte en su propia página /join)
 -- deep : abre la app directamente (roblox://)
 local function buildJoinLinks()
 	local jobId = game.JobId
@@ -716,8 +718,8 @@ end
 local function sendErrorText(code)
 	if code == 403 then return "clave incorrecta (403)" end
 	if code == 429 then return "límite del Worker (429)" end
-	if code == 502 then return "Discord rechazó el aviso (502)" end
-	if code == 500 then return "Worker sin WEBHOOK_URL (500)" end
+	if code == 502 then return "el Worker no pudo publicar el aviso (502)" end
+	if code == 500 then return "error interno del Worker (500)" end
 	if code == 400 then return "petición inválida (400)" end
 	if code == 0 then return "sin respuesta del Worker" end
 	return "error " .. tostring(code)
@@ -802,15 +804,15 @@ local function isAutoNotifyCandidate(e)
 		and isNotifiable(e) and not sentUids[notifyKey(e)]
 end
 
-local function notifyDiscord(list)
-	if not discordOn or not C.DISCORD_CONFIGURED or not httpRequest or sending then return end
+local function notifyRadar(list)
+	if not radarOn or not C.RELAY_CONFIGURED or not httpRequest or sending then return end
 	if _G.EggHunterInstance ~= INSTANCE_ID then return end
 	if game.JobId == "" then return end -- sin JobId no hay link válido
-	if os.clock() < discordBlockedUntil then return end
+	if os.clock() < radarBlockedUntil then return end
 
 	local blocked, why = cycleBlocksNotify()
 	if blocked then
-		setDiscordStatus("Discord en pausa: " .. why, 6)
+		setRadarStatus("Radar en pausa: " .. why, 6)
 		return
 	end
 
@@ -833,7 +835,7 @@ local function notifyDiscord(list)
 	end
 
 	if #pending == 0 then
-		if unknownNote ~= "" then setDiscordStatus("Discord: nada nuevo" .. unknownNote, 10) end
+		if unknownNote ~= "" then setRadarStatus("Radar: nada nuevo" .. unknownNote, 10) end
 		return
 	end
 	table.sort(pending, function(a, b)
@@ -854,13 +856,13 @@ local function notifyDiscord(list)
 		local discardNote = (discarded or 0) > 0 and string.format(" • %d descartado(s): ya no disponibles", discarded) or ""
 		if failed then
 			local block = (failCode == 403 or failCode == 400 or failCode == 500) and 300 or 60
-			discordBlockedUntil = os.clock() + block
+			radarBlockedUntil = os.clock() + block
 			warn("[EggHunter] aviso automático falló:", failCode, failBody)
-			setDiscordStatus(string.format("Discord falló: %s • reintento en %ds", sendErrorText(failCode), block), block)
+			setRadarStatus(string.format("Radar falló: %s • reintento en %ds", sendErrorText(failCode), block), block)
 		elseif verr then
-			setDiscordStatus("Discord: no pude validar (" .. tostring(verr) .. "), reintento pronto" .. discardNote, 10)
+			setRadarStatus("Radar: no pude validar (" .. tostring(verr) .. "), reintento pronto" .. discardNote, 10)
 		else
-			setDiscordStatus(string.format("Discord: %d aviso(s) enviado(s)", sent) .. discardNote .. unknownNote, 15)
+			setRadarStatus(string.format("Radar: %d aviso(s) enviado(s)", sent) .. discardNote .. unknownNote, 15)
 		end
 	end)
 end
@@ -921,7 +923,7 @@ local function loadEggs(manual)
 		refreshSubtitle()
 
 		if list then
-			local okN, errN = pcall(notifyDiscord, list)
+			local okN, errN = pcall(notifyRadar, list)
 			if not okN then warn("[EggHunter] error en avisos:", errN) end
 		end
 	end)
@@ -1014,6 +1016,7 @@ local function loadState()
 						state.serverList, state.serverListAt = d.serverList, d.serverListAt
 					end
 					if type(d.blockedUntil) == "number" then state.blockedUntil = d.blockedUntil end
+					if type(d.pickedId) == "string" then state.pickedId = d.pickedId end
 					state.huntActive = false
 					if type(d.huntLastRare) == "number" then state.huntLastRare = d.huntLastRare end
 				end
@@ -1032,8 +1035,16 @@ local function loadState()
 end
 loadState()
 
--- Marco este servidor como ocupado para que otros bots no entren
-if game.JobId ~= "" then task.spawn(claimServer, game.JobId) end
+-- Marco este servidor como ocupado para que otros bots no entren.
+-- Si llegué por /api/claim/pick, el Worker ya lo reservó antes del salto: no se repite.
+if game.JobId ~= "" then
+	if state.pickedId == game.JobId then
+		state.pickedId = nil
+		saveState()
+	else
+		task.spawn(claimServer, game.JobId)
+	end
+end
 
 local function applyHopState()
 	UI.setAutoHop(state.autoHop)
@@ -1151,7 +1162,8 @@ local TIERS = {
 }
 
 -- Reserva un servidor de la lista (ya ordenada por preferencia).
--- Devuelve el servidor reclamado, o nil + motivo.
+-- Devuelve: servidor, error, reservado
+--   reservado = true cuando el Worker confirmó la reserva (al llegar no hace falta repetirla).
 local function claimPick(list)
 	if not C.CLAIM_ENABLED or not httpRequest or C.RELAY_URL == "" then return list[1] end
 
@@ -1174,9 +1186,9 @@ local function claimPick(list)
 			local okJ, data = pcall(function() return HttpService:JSONDecode(res.Body) end)
 			if okJ and type(data) == "table" and type(data.serverId) == "string" then
 				for _, s in ipairs(list) do
-					if s.id == data.serverId then return s end
+					if s.id == data.serverId then return s, nil, true end
 				end
-				return { id = data.serverId, playing = 0, maxPlayers = 0 }
+				return { id = data.serverId, playing = 0, maxPlayers = 0 }, nil, true
 			end
 			return list[1]
 		elseif code == 409 then
@@ -1193,7 +1205,7 @@ local function claimPick(list)
 
 	-- Respaldo (Worker antiguo): claim de uno en uno
 	for i = 1, math.min(#list, 6) do
-		if claimServer(list[i].id) then return list[i] end
+		if claimServer(list[i].id) then return list[i], nil, true end
 		badServers[list[i].id] = os.clock() - C.BAD_SERVER_TTL + 120
 	end
 	return nil, "servidor reclamado por otro bot"
@@ -1238,7 +1250,7 @@ local function pickServer()
 		return nil, "Sin servidores de 0-" .. C.MAX_PLAYERS_HARD .. " jugadores, pido otra lista"
 	end
 
-	local server, err = claimPick(ordered)
+	local server, err, claimed = claimPick(ordered)
 	if not server then return nil, err or "Todos los servidores están reclamados" end
 
 	for i, s in ipairs(serverCache) do
@@ -1247,7 +1259,7 @@ local function pickServer()
 			break
 		end
 	end
-	return server
+	return server, nil, claimed
 end
 
 local function hopServer()
@@ -1273,8 +1285,8 @@ local function hopServer()
 
 		if not useRandom then
 			UI.setHop("Buscando servidor...", THEME.Cyan)
-			local err
-			server, err = pickServer()
+			local err, claimed
+			server, err, claimed = pickServer()
 			if server and teleportFails >= C.FAILS_BEFORE_RANDOM then
 				-- Varios teleports seguidos fallaron: devuelvo la reserva y pruebo uno aleatorio
 				releaseServer(server.id)
@@ -1284,6 +1296,8 @@ local function hopServer()
 			elseif server then
 				pickFails = 0
 				state.visited[server.id] = os.time()
+				-- si el Worker ya lo reservó, al llegar no hace falta reservarlo otra vez
+				state.pickedId = claimed and server.id or nil
 				saveState()
 			else
 				pickFails += 1
@@ -1439,8 +1453,8 @@ local function hasRareHere()
 end
 
 local function hasPendingNotify()
-	if not discordOn or not C.DISCORD_CONFIGURED or not httpRequest then return false end
-	if os.clock() < discordBlockedUntil then return false end
+	if not radarOn or not C.RELAY_CONFIGURED or not httpRequest then return false end
+	if os.clock() < radarBlockedUntil then return false end
 	if cycleBlocksNotify() then return false end
 	for _, e in ipairs(eggs) do
 		if isAutoNotifyCandidate(e) then return true end
