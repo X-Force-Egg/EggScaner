@@ -42,6 +42,51 @@ local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
 
+--==================================================
+-- ANTI-ERROR 279 (Auto-Rejoin / Watchdog)
+--==================================================
+local TeleportService = game:GetService("TeleportService")
+local NetworkClient = game:GetService("NetworkClient")
+
+local lastServerResponse = tick()
+local REJOIN_TIMEOUT = 15 -- Segundos sin respuesta antes de intentar reconectar
+
+-- 1. Detección inmediata de desconexión (cuando te saca del juego)
+NetworkClient.ChildRemoved:Connect(function(child)
+    if child:IsA("Player") and child == LocalPlayer then
+        task.wait(2)
+        pcall(function()
+            TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        end)
+    end
+end)
+
+-- 2. Watchdog (perro guardián) por si el error 279 congela la pantalla
+task.spawn(function()
+    while task.wait(5) do
+        -- Si el juego está cargando (por un salto normal del script), no hacemos nada
+        if not game:IsLoaded() then 
+            lastServerResponse = tick()
+            continue 
+        end
+
+        local success = pcall(function()
+            return workspace:GetServerTimeNow()
+        end)
+        
+        if success then
+            lastServerResponse = tick()
+        else
+            if tick() - lastServerResponse > REJOIN_TIMEOUT then
+                pcall(function()
+                    TeleportService:Teleport(game.PlaceId, LocalPlayer)
+                end)
+                lastServerResponse = tick()
+            end
+        end
+    end
+end)
+
 -- Semilla única por instancia para que varios bots no elijan el mismo servidor
 pcall(function()
 	local seed = math.floor(tick() * 100000) % 2147483647
