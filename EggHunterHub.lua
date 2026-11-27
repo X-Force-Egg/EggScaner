@@ -13,7 +13,11 @@
       - Raro CONFIRMADO (2 escaneos seguidos) → avisa al radar y salta.
       - Sin raro y HOP_WHEN_DRY = true → salta rápido a otro servidor
         (solo dentro de la ventana de búsqueda). Con false, se queda quieto.
-      - Ventana de búsqueda ~4 minutos (235s) tras cada renovación.
+      - Ventana de búsqueda tras cada renovación, de DOS tamaños:
+          · Si este ciclo ya salió un raro (lo vio este bot): sigue buscando ~4 min (SEARCH_WINDOW = 235s).
+          · Si no salió nada: busca solo 1 min (QUICK_WINDOW = 60s); si no hubo nada,
+            se queda quieto ("Descansando") y espera al siguiente reinicio.
+        Si aparece un raro cuando ya estaba descansando, vuelve a buscar hasta los 235s.
       - Salto rápido (3s + 0-2s de jitter aleatorio).
       - Sistema de "Claim": evita que dos bots entren al mismo servidor.
         Un solo pedido /api/claim/pick reserva el primer servidor libre de una lista.
@@ -76,7 +80,7 @@ C.NOTIFY_HOP_GRACE = 6
 -- Espera a que el servidor se llene tras una renovación
 C.EXPECTED_EGGS = 70
 C.FILL_RATIO = 0.85
-C.FILL_WAIT_MAX = 55
+C.FILL_WAIT_MAX = 30   -- (antes 55) debe ser bastante menor que SEARCH_WINDOW
 C.FILL_STABLE_SECONDS = 8
 
 -- Salto de servidor (Optimizado Multi-Bot)
@@ -120,7 +124,8 @@ C.HOLD_IF_ALONE = true  -- raro + solo en el servidor = no saltar (si no, el ser
 C.CYCLE_MODE = "auto"
 C.CYCLE_SECONDS = 300
 C.CYCLE_OFFSET = 0
-C.SEARCH_WINDOW = 235
+C.SEARCH_WINDOW = 235  -- ventana LARGA: si ya salió un raro este ciclo, sigue buscando hasta este segundo
+C.QUICK_WINDOW = 60    -- ventana CORTA: si NO salió nada, busca solo hasta este segundo y espera el reinicio
 C.CALIBRATION_TIMEOUT = 1500
 C.MIN_NEW_FOR_SAMPLE = 10
 C.CYCLE_RESET = false
@@ -1019,6 +1024,7 @@ local function loadState()
 					if type(d.pickedId) == "string" then state.pickedId = d.pickedId end
 					state.huntActive = false
 					if type(d.huntLastRare) == "number" then state.huntLastRare = d.huntLastRare end
+					if type(d.rareCycleStart) == "number" then state.rareCycleStart = d.rareCycleStart end
 				end
 			end
 		end)
@@ -1477,6 +1483,12 @@ local function fillStatus()
 	return false
 end
 
+-- ¿Ya se vio un raro en el ciclo actual? (se guarda en el archivo, así sobrevive a los saltos)
+local function rareThisCycle(phase)
+	if not phase or type(state.rareCycleStart) ~= "number" then return false end
+	return math.abs(state.rareCycleStart - math.floor(serverClock() - phase + 0.5)) <= 2
+end
+
 --==================================================
 -- BUCLE DE CAZA
 --==================================================
@@ -1494,7 +1506,10 @@ task.spawn(function()
 
 		local ready = scannedOnce or (os.clock() - startedAt) > C.SCAN_TIMEOUT
 		local phase = cyclePhase()
-		local stale = phase ~= nil and phase >= C.SEARCH_WINDOW
+		-- Ventana larga si ya salió un raro este ciclo; corta si no ha salido nada
+		local foundCycle = rareThisCycle(phase)
+		local windowLen = foundCycle and C.SEARCH_WINDOW or C.QUICK_WINDOW
+		local stale = phase ~= nil and phase >= windowLen
 		local calibrating = C.CYCLE_MODE == "auto" and state.cycleOffset == nil
 			and (os.clock() - startedAt) < C.CALIBRATION_TIMEOUT
 		local now = os.time()
@@ -1514,6 +1529,15 @@ task.spawn(function()
 			and (os.clock() - lastScan.at) < 25 and hasRareHere()
 		local dryConfirmed = C.HOP_WHEN_DRY and not rareConfirmed
 			and dryCount >= C.DRY_SCANS_NEEDED and scannedOnce
+
+		-- Salió un raro: este ciclo se busca con la ventana larga (aunque ya estuviera descansando)
+		if rareConfirmed and phase and not foundCycle then
+			state.rareCycleStart = math.floor(serverClock() - phase + 0.5)
+			saveState()
+			foundCycle = true
+			windowLen = C.SEARCH_WINDOW
+			stale = phase >= windowLen
+		end
 
 		if rareConfirmed then
 			state.huntLastRare = now
@@ -1551,7 +1575,8 @@ task.spawn(function()
 		elseif stale then
 			hopAt, hopCap = nil, nil
 			dryCount = 0
-			UI.setHop(string.format("Descansando: nuevos huevos en %ds", math.ceil(C.CYCLE_SECONDS - phase)), THEME.Gold)
+			UI.setHop(string.format(foundCycle and "Descansando: nuevos huevos en %ds"
+				or "Sin raros este ciclo: espero el reinicio en %ds", math.ceil(C.CYCLE_SECONDS - phase)), THEME.Gold)
 
 		elseif rareConfirmed or dryConfirmed then
 			local filling, fillN = fillStatus()
@@ -1578,7 +1603,7 @@ task.spawn(function()
 				if left > 0 and left <= 4 then prefetchList() end
 
 				if left > 0 then
-					local windowLeft = phase and math.max(0, math.ceil(C.SEARCH_WINDOW - phase)) or nil
+					local windowLeft = phase and math.max(0, math.ceil(windowLen - phase)) or nil
 					UI.setHop(
 						string.format(rareConfirmed and "¡Raro aquí! Saltando en %ds%s" or "Sin raro aquí • saltando en %ds%s",
 							left, windowLeft and (" • ventana: " .. windowLeft .. "s") or ""),
