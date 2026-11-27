@@ -29,7 +29,7 @@ local TeleportService = game:GetService("TeleportService")
 local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
-local canFile = false
+local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
 
 --==================================================
 -- CONFIG
@@ -137,6 +137,7 @@ local okUI, buildUI = pcall(function()
 		src = readfile(C.UI_FILE)
 	else
 		src = game:HttpGet(C.BASE_URL .. C.UI_FILE)
+		if canFile then pcall(writefile, C.UI_FILE, src) end -- GUARDA LA UI
 	end
 	return loadstring(src)()
 end)
@@ -164,7 +165,14 @@ end
 -- PRECIOS
 --==================================================
 local okLoad, PRICE_LIST = pcall(function()
-	return loadstring(game:HttpGet(C.BASE_URL .. "precios.lua"))()
+	local src
+	if canFile and isfile("precios.lua") then
+		src = readfile("precios.lua")
+	else
+		src = game:HttpGet(C.BASE_URL .. "precios.lua")
+		if canFile then pcall(writefile, "precios.lua", src) end -- Guarda los precios en el celular la primera vez
+	end
+	return loadstring(src)()
 end)
 if not okLoad or type(PRICE_LIST) ~= "table" then
 	warn("No se pudo cargar precios.lua:", PRICE_LIST)
