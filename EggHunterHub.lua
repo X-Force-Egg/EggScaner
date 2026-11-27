@@ -9,28 +9,12 @@
       Tamaño <= 5 -> Tamaño ^ 1.85
       Tamaño >  5 -> (Tamaño / 5) ^ 1.2 * 19.637875755794113
 
-    MODO CACERÍA (ajustado 26-Nov-2026 · v2 multi-bot):
+    MODO CACERÍA (v2 Multi-Bot):
       - Sin Secret/Eternal/Divine disponible en ESTA sala → NO salta.
-      - Solo salta cuando hay un raro CONFIRMADO (2 escaneos seguidos) en la sala actual.
-      - Espera mejor a que se llenen los huevos después de la renovación.
-      - SEARCH_WINDOW ahora ~4 minutos (235 s).
-
-    MULTI-BOT (v2):
-      - Cada bot reclama el servidor destino en el Worker (D1) antes de saltar.
-        Si otro bot ya lo tiene → 409 → se elige otro servidor.
-      - math.randomseed único por instancia (UserId + JobId + tick).
-      - Jitter de 0-2 s extra al saltar para dispersarse.
-      - Al fallar teleport (init o timeout) se libera el claim → otro bot puede usarlo.
-      - Si el Worker no soporta /api/claim → fallback automático a "solo jitter".
-
-    CAMBIOS CLAVE:
-      - SEARCH_WINDOW 180 → 235 s (casi 4 min)
-      - HOP_DELAY_SECONDS 6 → 3 s
-      - NOTIFY_HOP_GRACE 10 → 6 s
-      - HOP_JITTER nuevo = 2 s
-      - CLAIM_ENABLED + CLAIM_TTL nuevos
-      - DROP_UNKNOWN_STATE = false: huevos sin State se muestran y avisan.
-      - Salto de servidor: 2-5 jugadores ideal, máximo 7.
+      - Solo salta cuando hay un raro CONFIRMADO (2 escaneos seguidos).
+      - Ventana de búsqueda ampliada a ~4 minutos (235s).
+      - Salto rápido (3s + 0-2s de jitter aleatorio).
+      - Sistema de "Claim": evita que dos bots entren al mismo servidor.
 ]]
 
 local Players = game:GetService("Players")
@@ -41,51 +25,6 @@ local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
 local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
-
---==================================================
--- ANTI-ERROR 279 (Auto-Rejoin / Watchdog)
---==================================================
-local TeleportService = game:GetService("TeleportService")
-local NetworkClient = game:GetService("NetworkClient")
-
-local lastServerResponse = tick()
-local REJOIN_TIMEOUT = 15 -- Segundos sin respuesta antes de intentar reconectar
-
--- 1. Detección inmediata de desconexión (cuando te saca del juego)
-NetworkClient.ChildRemoved:Connect(function(child)
-    if child:IsA("Player") and child == LocalPlayer then
-        task.wait(2)
-        pcall(function()
-            TeleportService:Teleport(game.PlaceId, LocalPlayer)
-        end)
-    end
-end)
-
--- 2. Watchdog (perro guardián) por si el error 279 congela la pantalla
-task.spawn(function()
-    while task.wait(5) do
-        -- Si el juego está cargando (por un salto normal del script), no hacemos nada
-        if not game:IsLoaded() then 
-            lastServerResponse = tick()
-            continue 
-        end
-
-        local success = pcall(function()
-            return workspace:GetServerTimeNow()
-        end)
-        
-        if success then
-            lastServerResponse = tick()
-        else
-            if tick() - lastServerResponse > REJOIN_TIMEOUT then
-                pcall(function()
-                    TeleportService:Teleport(game.PlaceId, LocalPlayer)
-                end)
-                lastServerResponse = tick()
-            end
-        end
-    end
-end)
 
 -- Semilla única por instancia para que varios bots no elijan el mismo servidor
 pcall(function()
@@ -122,7 +61,7 @@ C.NOTIFY_MIN_REMAINING = 25
 C.NOTIFY_RENEW_SETTLE = 6
 C.DROPPED_PRIORITY_BOOST = 2
 C.VALIDATION_DEBUG = false
-C.NOTIFY_HOP_GRACE = 6                -- ANTES 10 → más ágil
+C.NOTIFY_HOP_GRACE = 6 -- Reducido de 10 a 6 para saltar más rápido
 
 -- Espera a que el servidor se llene tras una renovación
 C.EXPECTED_EGGS = 70
@@ -130,10 +69,10 @@ C.FILL_RATIO = 0.85
 C.FILL_WAIT_MAX = 55
 C.FILL_STABLE_SECONDS = 8
 
--- Salto de servidor (v2: más rápido + multi-bot)
+-- Salto de servidor (Optimizado Multi-Bot)
 C.SCRIPT_URL = "https://raw.githubusercontent.com/X-Force-Egg/EggScaner/main/EggHunterHub.lua"
-C.HOP_DELAY_SECONDS = 3               -- ANTES 6 → 3 s
-C.HOP_JITTER = 2                      -- 0-2 s aleatorio extra
+C.HOP_DELAY_SECONDS = 3 -- Reducido de 6 a 3 segundos
+C.HOP_JITTER = 2        -- Añadido: 0-2s extra aleatorio
 C.SCAN_TIMEOUT = 25
 C.RARE_MIN_VALUE = 0
 C.HUNT_IDLE_SECONDS = 300
@@ -155,15 +94,15 @@ C.HOP_MODE = "list"
 C.FAILS_BEFORE_RANDOM = 3
 C.SAVE_FILE = "EggHunterHub_state.json"
 
--- Claim multi-bot (reclamo de servidor en el Worker)
+-- Claim Multi-Bot
 C.CLAIM_ENABLED = true
-C.CLAIM_TTL = 360                     -- 6 min: cubre visita (~4 min) + colchón
+C.CLAIM_TTL = 360
 
 -- Ciclo
 C.CYCLE_MODE = "auto"
 C.CYCLE_SECONDS = 300
 C.CYCLE_OFFSET = 0
-C.SEARCH_WINDOW = 235                 -- ANTES 180 → casi 4 min
+C.SEARCH_WINDOW = 235 -- Aumentado de 180 a 235 (casi 4 minutos)
 C.CALIBRATION_TIMEOUT = 1500
 C.MIN_NEW_FOR_SAMPLE = 10
 C.CYCLE_RESET = false
@@ -972,7 +911,7 @@ local function isBad(id)
 end
 
 --==================================================
--- CLAIM MULTI-BOT (reclamo de servidor en el Worker)
+-- CLAIM MULTI-BOT
 --==================================================
 local function claimServer(serverId)
 	if not C.CLAIM_ENABLED or not httpRequest or C.RELAY_URL == "" then return true end
@@ -1369,6 +1308,7 @@ local function hasPendingNotify()
 	return false
 end
 
+-- ¿Se están llenando todavía los huevos?
 local function fillStatus()
 	if C.EXPECTED_EGGS <= 0 or not scannedOnce then return false end
 	local n = #eggs
@@ -1376,6 +1316,7 @@ local function fillStatus()
 	if phase ~= nil and phase < C.FILL_STABLE_SECONDS then return true, n end
 	if n >= math.ceil(C.EXPECTED_EGGS * C.FILL_RATIO) then return false end
 	if phase then
+		-- Después de la renovación espera más tiempo
 		return phase < C.FILL_WAIT_MAX, n
 	end
 	if lastGrowAt > 0 and os.clock() - lastGrowAt < C.FILL_STABLE_SECONDS then return true, n end
