@@ -9,17 +9,28 @@
       Tamaño <= 5 -> Tamaño ^ 1.85
       Tamaño >  5 -> (Tamaño / 5) ^ 1.2 * 19.637875755794113
 
-    MODO CACERÍA (corregido 26-Nov-2026):
+    MODO CACERÍA (ajustado 26-Nov-2026 · v2 multi-bot):
       - Sin Secret/Eternal/Divine disponible en ESTA sala → NO salta.
       - Solo salta cuando hay un raro CONFIRMADO (2 escaneos seguidos) en la sala actual.
-      - Después de la renovación espera a que salgan/llenen los huevos antes de decidir.
-      - Termina al pasar SEARCH_WINDOW o tras HUNT_IDLE_SECONDS sin ver raros.
+      - Espera mejor a que se llenen los huevos después de la renovación.
+      - SEARCH_WINDOW ahora ~4 minutos (235 s).
 
-    CAMBIOS:
-      - DROP_UNKNOWN_STATE = false: los huevos sin State (eventos admin abuse) ya se muestran y avisan.
-      - Salto de servidor: 2-5 jugadores ideal, máximo 7; lista pedida ~1 vez por salto + prefetch.
-      - FIX: ya no salta "por gusto" cuando no hay nada bueno.
-      - FIX: espera mejor el llenado de huevos después de la renovación.
+    MULTI-BOT (v2):
+      - Cada bot reclama el servidor destino en el Worker (D1) antes de saltar.
+        Si otro bot ya lo tiene → 409 → se elige otro servidor.
+      - math.randomseed único por instancia (UserId + JobId + tick).
+      - Jitter de 0-2 s extra al saltar para dispersarse.
+      - Al fallar teleport (init o timeout) se libera el claim → otro bot puede usarlo.
+      - Si el Worker no soporta /api/claim → fallback automático a "solo jitter".
+
+    CAMBIOS CLAVE:
+      - SEARCH_WINDOW 180 → 235 s (casi 4 min)
+      - HOP_DELAY_SECONDS 6 → 3 s
+      - NOTIFY_HOP_GRACE 10 → 6 s
+      - HOP_JITTER nuevo = 2 s
+      - CLAIM_ENABLED + CLAIM_TTL nuevos
+      - DROP_UNKNOWN_STATE = false: huevos sin State se muestran y avisan.
+      - Salto de servidor: 2-5 jugadores ideal, máximo 7.
 ]]
 
 local Players = game:GetService("Players")
@@ -30,6 +41,16 @@ local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
 local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+
+-- Semilla única por instancia para que varios bots no elijan el mismo servidor
+pcall(function()
+	local seed = math.floor(tick() * 100000) % 2147483647
+	if game.JobId and #game.JobId >= 1 then
+		seed = seed + game.JobId:byte(1) * 7919
+	end
+	seed = seed + (LocalPlayer.UserId % 100003)
+	math.randomseed(seed)
+end)
 
 --==================================================
 -- CONFIG
@@ -56,17 +77,18 @@ C.NOTIFY_MIN_REMAINING = 25
 C.NOTIFY_RENEW_SETTLE = 6
 C.DROPPED_PRIORITY_BOOST = 2
 C.VALIDATION_DEBUG = false
-C.NOTIFY_HOP_GRACE = 10
+C.NOTIFY_HOP_GRACE = 6                -- ANTES 10 → más ágil
 
 -- Espera a que el servidor se llene tras una renovación
 C.EXPECTED_EGGS = 70
-C.FILL_RATIO = 0.85                 -- un poco más estricto
-C.FILL_WAIT_MAX = 55                -- espera más después de la renovación
+C.FILL_RATIO = 0.85
+C.FILL_WAIT_MAX = 55
 C.FILL_STABLE_SECONDS = 8
 
--- Salto de servidor
+-- Salto de servidor (v2: más rápido + multi-bot)
 C.SCRIPT_URL = "https://raw.githubusercontent.com/X-Force-Egg/EggScaner/main/EggHunterHub.lua"
-C.HOP_DELAY_SECONDS = 6
+C.HOP_DELAY_SECONDS = 3               -- ANTES 6 → 3 s
+C.HOP_JITTER = 2                      -- 0-2 s aleatorio extra
 C.SCAN_TIMEOUT = 25
 C.RARE_MIN_VALUE = 0
 C.HUNT_IDLE_SECONDS = 300
@@ -88,11 +110,15 @@ C.HOP_MODE = "list"
 C.FAILS_BEFORE_RANDOM = 3
 C.SAVE_FILE = "EggHunterHub_state.json"
 
+-- Claim multi-bot (reclamo de servidor en el Worker)
+C.CLAIM_ENABLED = true
+C.CLAIM_TTL = 360                     -- 6 min: cubre visita (~4 min) + colchón
+
 -- Ciclo
 C.CYCLE_MODE = "auto"
 C.CYCLE_SECONDS = 300
 C.CYCLE_OFFSET = 0
-C.SEARCH_WINDOW = 180
+C.SEARCH_WINDOW = 235                 -- ANTES 180 → casi 4 min
 C.CALIBRATION_TIMEOUT = 1500
 C.MIN_NEW_FOR_SAMPLE = 10
 C.CYCLE_RESET = false
@@ -119,7 +145,8 @@ local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.Keyboar
 if IS_MOBILE then
 	C.AUTO_REFRESH_SECONDS = 5.5
 	C.MAX_CARDS = 7
-	C.HOP_DELAY_SECONDS = 7
+	C.HOP_DELAY_SECONDS = 3
+	C.HOP_JITTER = 2.5
 end
 
 --==================================================
@@ -137,7 +164,7 @@ local okUI, buildUI = pcall(function()
 		src = readfile(C.UI_FILE)
 	else
 		src = game:HttpGet(C.BASE_URL .. C.UI_FILE)
-		if canFile then pcall(writefile, C.UI_FILE, src) end -- GUARDA LA UI
+		if canFile then pcall(writefile, C.UI_FILE, src) end
 	end
 	return loadstring(src)()
 end)
@@ -170,7 +197,7 @@ local okLoad, PRICE_LIST = pcall(function()
 		src = readfile("precios.lua")
 	else
 		src = game:HttpGet(C.BASE_URL .. "precios.lua")
-		if canFile then pcall(writefile, "precios.lua", src) end -- Guarda los precios en el celular la primera vez
+		if canFile then pcall(writefile, "precios.lua", src) end
 	end
 	return loadstring(src)()
 end)
@@ -338,7 +365,6 @@ local lastScanMsg = "Preparando..."
 local discordStatus, discordStatusUntil = "", 0
 local discordBlockedUntil = 0
 
--- Contador de confirmación de raro
 local rareConfirmCount = 0
 local confirmedScanRevision = -1
 local scanRevision = 0
@@ -900,6 +926,48 @@ local function isBad(id)
 	return false
 end
 
+--==================================================
+-- CLAIM MULTI-BOT (reclamo de servidor en el Worker)
+--==================================================
+local function claimServer(serverId)
+	if not C.CLAIM_ENABLED or not httpRequest or C.RELAY_URL == "" then return true end
+	local ok, res = pcall(httpRequest, {
+		Url = C.RELAY_URL .. "/api/claim",
+		Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = HttpService:JSONEncode({
+			key = C.RELAY_KEY,
+			serverId = tostring(serverId),
+			botId = game.JobId,
+			ttl = C.CLAIM_TTL,
+		}),
+	})
+	if not ok or type(res) ~= "table" then return true end
+	local code = res.StatusCode or 0
+	if code == 200 then return true end
+	if code == 409 then return false end
+	if code == 404 or code == 405 then
+		C.CLAIM_ENABLED = false
+		print("[EggHunter] Worker sin /api/claim → solo jitter multi-bot")
+		return true
+	end
+	return true
+end
+
+local function releaseServer(serverId)
+	if not C.CLAIM_ENABLED or not httpRequest or C.RELAY_URL == "" or not serverId then return end
+	pcall(httpRequest, {
+		Url = C.RELAY_URL .. "/api/claim/release",
+		Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = HttpService:JSONEncode({
+			key = C.RELAY_KEY,
+			serverId = tostring(serverId),
+			botId = game.JobId,
+		}),
+	})
+end
+
 function saveState()
 	if not canFile then return end
 	pcall(function() writefile(C.SAVE_FILE, HttpService:JSONEncode(state)) end)
@@ -926,8 +994,6 @@ local function loadState()
 						state.serverList, state.serverListAt = d.serverList, d.serverListAt
 					end
 					if type(d.blockedUntil) == "number" then state.blockedUntil = d.blockedUntil end
-					-- NO restauramos huntActive automáticamente al reiniciar
-					-- Solo se activa de nuevo si realmente ve un raro
 					state.huntActive = false
 					if type(d.huntLastRare) == "number" then state.huntLastRare = d.huntLastRare end
 					if type(d.huntDry) == "number" then state.huntDry = d.huntDry end
@@ -1062,7 +1128,7 @@ local TIERS = {
 	function(s) return true end,
 }
 
-local function pickServer()
+local function pickServerOnce()
 	local waited = 0
 	while fetching and waited < 15 do waited += task.wait(0.2) end
 	refreshList()
@@ -1090,6 +1156,20 @@ local function pickServer()
 	state.serverList = nil
 	sortFlip = not sortFlip
 	return nil, "Sin servidores de 0-" .. C.MAX_PLAYERS_HARD .. " jugadores, pido otra lista"
+end
+
+local function pickServer()
+	local lastErr
+	for _ = 1, 6 do
+		local server, err = pickServerOnce()
+		if not server then return nil, err or "Sin servidores disponibles" end
+		if claimServer(server.id) then
+			return server
+		end
+		badServers[server.id] = os.clock()
+		lastErr = "servidor reclamado por otro bot"
+	end
+	return nil, lastErr or "Todos los servidores están reclamados"
 end
 
 local function hopServer()
@@ -1161,7 +1241,10 @@ local function hopServer()
 
 		if not ok then
 			warn("[EggHunter] el teleport no pudo iniciar:", perr)
-			if server then badServers[server.id] = os.clock() end
+			if server then
+				badServers[server.id] = os.clock()
+				releaseServer(server.id)
+			end
 			teleportFails += 1
 			fastRetry = true
 			UI.setHop("Falló el teleport, probando otro servidor...", THEME.Warn)
@@ -1173,7 +1256,10 @@ local function hopServer()
 		task.delay(C.TELEPORT_WAIT, function()
 			if UI.alive() and hopping and hopToken == myToken then
 				hopping = false
-				if currentTarget then badServers[currentTarget] = os.clock() end
+				if currentTarget then
+					badServers[currentTarget] = os.clock()
+					releaseServer(currentTarget)
+				end
 				hopRetryAt = os.clock() + C.HOP_RETRY_SECONDS
 			end
 		end)
@@ -1197,7 +1283,10 @@ table.insert(connections, TeleportService.TeleportInitFailed:Connect(function(pl
 		return
 	end
 
-	if currentTarget then badServers[currentTarget] = os.clock() end
+	if currentTarget then
+		badServers[currentTarget] = os.clock()
+		releaseServer(currentTarget)
+	end
 
 	local wait
 	if result == Enum.TeleportResult.Flooded then
@@ -1235,7 +1324,6 @@ local function hasPendingNotify()
 	return false
 end
 
--- ¿Se están llenando todavía los huevos?
 local function fillStatus()
 	if C.EXPECTED_EGGS <= 0 or not scannedOnce then return false end
 	local n = #eggs
@@ -1243,7 +1331,6 @@ local function fillStatus()
 	if phase ~= nil and phase < C.FILL_STABLE_SECONDS then return true, n end
 	if n >= math.ceil(C.EXPECTED_EGGS * C.FILL_RATIO) then return false end
 	if phase then
-		-- Después de la renovación espera más tiempo
 		return phase < C.FILL_WAIT_MAX, n
 	end
 	if lastGrowAt > 0 and os.clock() - lastGrowAt < C.FILL_STABLE_SECONDS then return true, n end
@@ -1251,11 +1338,8 @@ local function fillStatus()
 end
 
 --==================================================
--- BUCLE DE CAZA (CORREGIDO)
+-- BUCLE DE CAZA
 --==================================================
--- REGLA PRINCIPAL:
--- Solo salta si HAY un raro confirmado en ESTA sala ahora mismo.
--- Si no hay nada → se queda quieto escaneando.
 task.spawn(function()
 	local startedAt = os.clock()
 	local hopAt, hopCap
@@ -1275,7 +1359,6 @@ task.spawn(function()
 			and (os.clock() - startedAt) < C.CALIBRATION_TIMEOUT
 		local now = os.time()
 
-		-- Confirma solo con dos respuestas nuevas del servidor, no dos vueltas del bucle.
 		if scanRevision ~= confirmedScanRevision then
 			confirmedScanRevision = scanRevision
 			local rareNow = scannedOnce and (os.clock() - lastScan.at) < 25 and hasRareHere()
@@ -1294,7 +1377,6 @@ task.spawn(function()
 			end
 		end
 
-		-- Apagar cacería si se acaba la ventana o pasa mucho tiempo sin raros
 		if state.huntActive then
 			local endReason
 			if stale then
@@ -1323,17 +1405,17 @@ task.spawn(function()
 			hopAt, hopCap = nil, nil
 			UI.setHop(string.format("Descansando: nuevos huevos en %ds", math.ceil(C.CYCLE_SECONDS - phase)), THEME.Gold)
 
-		-- ========== SOLO SALTA SI HAY RARO AQUÍ ==========
 		elseif rareConfirmed then
 			local filling, fillN = fillStatus()
 
 			if filling then
-				-- Todavía se están llenando los huevos → espera
 				hopAt = nil
 				UI.setHop(string.format("Esperando huevos nuevos: %d/%d", fillN or 0, C.EXPECTED_EGGS), THEME.Cyan)
 			else
 				if not hopAt then
-					hopAt = os.clock() + (fastRetry and 1 or C.HOP_DELAY_SECONDS)
+					local base = fastRetry and 1 or C.HOP_DELAY_SECONDS
+					local jitter = math.random() * (C.HOP_JITTER or 0)
+					hopAt = os.clock() + base + jitter
 					hopCap = hopAt + C.NOTIFY_HOP_GRACE
 				end
 				if sending or isLoading or hasPendingNotify() then
@@ -1357,7 +1439,6 @@ task.spawn(function()
 				end
 			end
 
-		-- No hay raro → se queda quieto
 		else
 			hopAt, hopCap = nil, nil
 			if phase then
