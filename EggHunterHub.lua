@@ -2,19 +2,23 @@
     EGG HUNTER HUB - LÓGICA (usa EggHunterHub_UI.lua para el diseño)
 
     INSTALACIÓN (carpeta workspace de tu ejecutor):
-      1) EggHunterHub_UI.lua   -> el diseño
+      1) EggHunterHub_UI.lua   -> el diseño (SIN cambios)
       2) EggHunterHub.lua      -> este archivo (ponlo en autoexec si quieres)
 
     Valor = PrecioBase * FactorTamaño * MultiplicadorMutaciones
       Tamaño <= 5 -> Tamaño ^ 1.85
       Tamaño >  5 -> (Tamaño / 5) ^ 1.2 * 19.637875755794113
 
-    MODO CACERÍA (v2 Multi-Bot):
-      - Sin Secret/Eternal/Divine disponible en ESTA sala → NO salta.
-      - Solo salta cuando hay un raro CONFIRMADO (2 escaneos seguidos).
-      - Ventana de búsqueda ampliada a ~4 minutos (235s).
+    MODO CACERÍA (v3):
+      - Raro CONFIRMADO (2 escaneos seguidos) → avisa a Discord y salta.
+      - Sin raro y HOP_WHEN_DRY = true → salta rápido a otro servidor
+        (solo dentro de la ventana de búsqueda). Con false, se queda quieto.
+      - Ventana de búsqueda ~4 minutos (235s) tras cada renovación.
       - Salto rápido (3s + 0-2s de jitter aleatorio).
       - Sistema de "Claim": evita que dos bots entren al mismo servidor.
+        (v3.1) Un solo pedido /api/claim/pick reserva el primer servidor libre de una lista.
+      - Si el bot queda SOLO con un raro, se queda (HOLD_IF_ALONE) para que el link siga vivo.
+      - Cada aviso lleva el link de unión correcto (joinUrl + deepLink).
 ]]
 
 local Players = game:GetService("Players")
@@ -22,8 +26,12 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local okCoreGui, CoreGui = pcall(game.GetService, game, "CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
+-- Identidad estable del bot (antes era el JobId, que cambia en cada salto)
+local BOT_ID = tostring(LocalPlayer.UserId)
 local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
 
 -- Semilla única por instancia para que varios bots no elijan el mismo servidor
@@ -61,7 +69,7 @@ C.NOTIFY_MIN_REMAINING = 25
 C.NOTIFY_RENEW_SETTLE = 6
 C.DROPPED_PRIORITY_BOOST = 2
 C.VALIDATION_DEBUG = false
-C.NOTIFY_HOP_GRACE = 6 -- Reducido de 10 a 6 para saltar más rápido
+C.NOTIFY_HOP_GRACE = 6
 
 -- Espera a que el servidor se llene tras una renovación
 C.EXPECTED_EGGS = 70
@@ -71,12 +79,11 @@ C.FILL_STABLE_SECONDS = 8
 
 -- Salto de servidor (Optimizado Multi-Bot)
 C.SCRIPT_URL = "https://raw.githubusercontent.com/X-Force-Egg/EggScaner/main/EggHunterHub.lua"
-C.HOP_DELAY_SECONDS = 3 -- Reducido de 6 a 3 segundos
-C.HOP_JITTER = 2        -- Añadido: 0-2s extra aleatorio
+C.HOP_DELAY_SECONDS = 3
+C.HOP_JITTER = 2
 C.SCAN_TIMEOUT = 25
 C.RARE_MIN_VALUE = 0
 C.HUNT_IDLE_SECONDS = 300
-C.HUNT_MAX_DRY_SERVERS = 8
 C.MIN_PLAYERS = 2
 C.MAX_PLAYERS_PREF = 5
 C.MAX_PLAYERS_HARD = 7
@@ -94,15 +101,24 @@ C.HOP_MODE = "list"
 C.FAILS_BEFORE_RANDOM = 3
 C.SAVE_FILE = "EggHunterHub_state.json"
 
+-- Salto cuando NO hay raro (true = sigue buscando en otros servidores durante la ventana)
+C.HOP_WHEN_DRY = true
+C.DRY_HOP_DELAY = 2
+C.DRY_SCANS_NEEDED = 2
+
 -- Claim Multi-Bot
 C.CLAIM_ENABLED = true
 C.CLAIM_TTL = 360
+C.AUTO_DISMISS_ERRORS = true -- cierra solo el cartel "Teleport Failed" (error 769 y similares)
+C.PICK_ENABLED = true   -- reserva por lote (necesita Worker v9.2)
+C.PICK_BATCH = 25       -- candidatos que se mandan al Worker por salto
+C.HOLD_IF_ALONE = true  -- raro + solo en el servidor = no saltar (si no, el servidor se cierra y el link muere)
 
 -- Ciclo
 C.CYCLE_MODE = "auto"
 C.CYCLE_SECONDS = 300
 C.CYCLE_OFFSET = 0
-C.SEARCH_WINDOW = 235 -- Aumentado de 180 a 235 (casi 4 minutos)
+C.SEARCH_WINDOW = 235
 C.CALIBRATION_TIMEOUT = 1500
 C.MIN_NEW_FOR_SAMPLE = 10
 C.CYCLE_RESET = false
@@ -350,6 +366,7 @@ local discordStatus, discordStatusUntil = "", 0
 local discordBlockedUntil = 0
 
 local rareConfirmCount = 0
+local dryCount = 0
 local confirmedScanRevision = -1
 local scanRevision = 0
 
@@ -653,7 +670,21 @@ local function post(url, payload)
 	return success, code, tostring(res.Body or "")
 end
 
+-- Links para entrar a ESTE servidor exacto.
+-- web  : abre Roblox y entra a la instancia (el que funciona en navegador/Discord)
+-- deep : abre la app directamente (roblox://)
+local function buildJoinLinks()
+	local jobId = game.JobId
+	if type(jobId) ~= "string" or jobId == "" then return nil, nil end
+	local placeId = math.floor(game.PlaceId)
+	return
+		string.format("https://www.roblox.com/games/start?placeId=%d&gameInstanceId=%s", placeId, jobId),
+		string.format("roblox://experiences/start?placeId=%d&gameInstanceId=%s", placeId, jobId)
+end
+
 local function buildRelayEgg(e)
+	local webLink, deepLink = buildJoinLinks()
+	local phase = cyclePhase()
 	return {
 		uid = tostring(e.uid),
 		name = e.name,
@@ -665,6 +696,11 @@ local function buildRelayEgg(e)
 		mutations = table.concat(e.mutList, ", "),
 		jobId = game.JobId,
 		placeId = tostring(game.PlaceId),
+		joinUrl = webLink,
+		deepLink = deepLink,
+		players = #Players:GetPlayers(),
+		maxPlayers = Players.MaxPlayers,
+		cycleEndsAt = phase and math.floor(serverClock() + (C.CYCLE_SECONDS - phase)) or nil,
 		state = e.state or "unknown",
 		version = e.version,
 		validatedAt = serverClock(),
@@ -674,7 +710,7 @@ end
 local function sendBatch(batch, force)
 	local chunk = {}
 	for _, e in ipairs(batch) do table.insert(chunk, buildRelayEgg(e)) end
-	return post(C.RELAY_URL, { key = C.RELAY_KEY, force = force == true, eggs = chunk })
+	return post(C.RELAY_URL, { key = C.RELAY_KEY, botId = BOT_ID, force = force == true, eggs = chunk })
 end
 
 local function sendErrorText(code)
@@ -750,9 +786,8 @@ local function deliver(pending)
 		if #claimed > 0 then
 			local okSend, code, body = sendBatch(claimed, false)
 			if not okSend then
-				if code ~= 0 then
-					for _, e in ipairs(claimed) do sentUids[notifyKey(e)] = nil end
-				end
+				-- Si falló (incluso sin respuesta) se libera para reintentar; el Worker deduplica
+				for _, e in ipairs(claimed) do sentUids[notifyKey(e)] = nil end
 				return sent, true, code, body, discarded
 			end
 			sent += #claimed
@@ -770,6 +805,7 @@ end
 local function notifyDiscord(list)
 	if not discordOn or not C.DISCORD_CONFIGURED or not httpRequest or sending then return end
 	if _G.EggHunterInstance ~= INSTANCE_ID then return end
+	if game.JobId == "" then return end -- sin JobId no hay link válido
 	if os.clock() < discordBlockedUntil then return end
 
 	local blocked, why = cycleBlocksNotify()
@@ -922,7 +958,7 @@ local function claimServer(serverId)
 		Body = HttpService:JSONEncode({
 			key = C.RELAY_KEY,
 			serverId = tostring(serverId),
-			botId = game.JobId,
+			botId = BOT_ID,
 			ttl = C.CLAIM_TTL,
 		}),
 	})
@@ -947,7 +983,7 @@ local function releaseServer(serverId)
 		Body = HttpService:JSONEncode({
 			key = C.RELAY_KEY,
 			serverId = tostring(serverId),
-			botId = game.JobId,
+			botId = BOT_ID,
 		}),
 	})
 end
@@ -980,7 +1016,6 @@ local function loadState()
 					if type(d.blockedUntil) == "number" then state.blockedUntil = d.blockedUntil end
 					state.huntActive = false
 					if type(d.huntLastRare) == "number" then state.huntLastRare = d.huntLastRare end
-					if type(d.huntDry) == "number" then state.huntDry = d.huntDry end
 				end
 			end
 		end)
@@ -996,6 +1031,9 @@ local function loadState()
 	saveState()
 end
 loadState()
+
+-- Marco este servidor como ocupado para que otros bots no entren
+if game.JobId ~= "" then task.spawn(claimServer, game.JobId) end
 
 local function applyHopState()
 	UI.setAutoHop(state.autoHop)
@@ -1112,7 +1150,56 @@ local TIERS = {
 	function(s) return true end,
 }
 
-local function pickServerOnce()
+-- Reserva un servidor de la lista (ya ordenada por preferencia).
+-- Devuelve el servidor reclamado, o nil + motivo.
+local function claimPick(list)
+	if not C.CLAIM_ENABLED or not httpRequest or C.RELAY_URL == "" then return list[1] end
+
+	if C.PICK_ENABLED then
+		local ids = {}
+		for i = 1, math.min(#list, C.PICK_BATCH) do ids[i] = list[i].id end
+
+		local ok, res = pcall(httpRequest, {
+			Url = C.RELAY_URL .. "/api/claim/pick",
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode({ key = C.RELAY_KEY, botId = BOT_ID, ids = ids, ttl = C.CLAIM_TTL }),
+		})
+		if not ok or type(res) ~= "table" then
+			return list[1] -- sin respuesta: no bloqueo el salto
+		end
+
+		local code = res.StatusCode or 0
+		if code == 200 then
+			local okJ, data = pcall(function() return HttpService:JSONDecode(res.Body) end)
+			if okJ and type(data) == "table" and type(data.serverId) == "string" then
+				for _, s in ipairs(list) do
+					if s.id == data.serverId then return s end
+				end
+				return { id = data.serverId, playing = 0, maxPlayers = 0 }
+			end
+			return list[1]
+		elseif code == 409 then
+			-- todos reclamados por otros bots: los evito ~2 min
+			for _, id in ipairs(ids) do badServers[id] = os.clock() - C.BAD_SERVER_TTL + 120 end
+			return nil, "todos los candidatos están reclamados por otros bots"
+		elseif code == 404 or code == 405 then
+			C.PICK_ENABLED = false
+			print("[EggHunter] Worker sin /api/claim/pick → claim individual")
+		else
+			return list[1] -- error temporal del Worker (403, 429, 5xx): sigo sin claim
+		end
+	end
+
+	-- Respaldo (Worker antiguo): claim de uno en uno
+	for i = 1, math.min(#list, 6) do
+		if claimServer(list[i].id) then return list[i] end
+		badServers[list[i].id] = os.clock() - C.BAD_SERVER_TTL + 120
+	end
+	return nil, "servidor reclamado por otro bot"
+end
+
+local function pickServer()
 	local waited = 0
 	while fetching and waited < 15 do waited += task.wait(0.2) end
 	refreshList()
@@ -1124,36 +1211,43 @@ local function pickServerOnce()
 		return nil, "Roblox no devolvió servidores"
 	end
 
+	-- Lista ordenada por preferencia: cada nivel mezclado al azar
+	local ordered, seen = {}, {}
 	for _, accept in ipairs(TIERS) do
 		local pool = {}
-		for i, s in ipairs(serverCache) do
-			if s.id ~= game.JobId and not isBad(s.id) and usable(s) and accept(s) then
-				table.insert(pool, i)
+		for _, s in ipairs(serverCache) do
+			if not seen[s.id] and s.id ~= game.JobId and not isBad(s.id) and usable(s) and accept(s) then
+				pool[#pool + 1] = s
 			end
 		end
-		if #pool > 0 then
-			return table.remove(serverCache, pool[math.random(#pool)])
+		for i = #pool, 2, -1 do
+			local j = math.random(i)
+			pool[i], pool[j] = pool[j], pool[i]
 		end
+		for _, s in ipairs(pool) do
+			seen[s.id] = true
+			ordered[#ordered + 1] = s
+		end
+		if #ordered >= C.PICK_BATCH then break end
 	end
 
-	serverCache = {}
-	state.serverList = nil
-	sortFlip = not sortFlip
-	return nil, "Sin servidores de 0-" .. C.MAX_PLAYERS_HARD .. " jugadores, pido otra lista"
-end
-
-local function pickServer()
-	local lastErr
-	for _ = 1, 6 do
-		local server, err = pickServerOnce()
-		if not server then return nil, err or "Sin servidores disponibles" end
-		if claimServer(server.id) then
-			return server
-		end
-		badServers[server.id] = os.clock()
-		lastErr = "servidor reclamado por otro bot"
+	if #ordered == 0 then
+		serverCache = {}
+		state.serverList = nil
+		sortFlip = not sortFlip
+		return nil, "Sin servidores de 0-" .. C.MAX_PLAYERS_HARD .. " jugadores, pido otra lista"
 	end
-	return nil, lastErr or "Todos los servidores están reclamados"
+
+	local server, err = claimPick(ordered)
+	if not server then return nil, err or "Todos los servidores están reclamados" end
+
+	for i, s in ipairs(serverCache) do
+		if s.id == server.id then
+			table.remove(serverCache, i)
+			break
+		end
+	end
+	return server
 end
 
 local function hopServer()
@@ -1181,7 +1275,13 @@ local function hopServer()
 			UI.setHop("Buscando servidor...", THEME.Cyan)
 			local err
 			server, err = pickServer()
-			if server then
+			if server and teleportFails >= C.FAILS_BEFORE_RANDOM then
+				-- Varios teleports seguidos fallaron: devuelvo la reserva y pruebo uno aleatorio
+				releaseServer(server.id)
+				server = nil
+				useRandom = true
+				UI.setHop("Varios errores de teleport: salto aleatorio", THEME.Warn)
+			elseif server then
 				pickFails = 0
 				state.visited[server.id] = os.time()
 				saveState()
@@ -1250,6 +1350,20 @@ local function hopServer()
 	end)
 end
 
+local lastInitFailAt = 0
+
+-- Cierra el cartel de error de teleport para que no tape la pantalla (mejor esfuerzo, depende del ejecutor)
+local function dismissErrorPrompt()
+	pcall(function() GuiService:ClearError() end)
+	pcall(function()
+		if not okCoreGui or not CoreGui then return end
+		local gui = CoreGui:FindFirstChild("RobloxPromptGui")
+		local overlay = gui and gui:FindFirstChild("promptOverlay")
+		local prompt = overlay and overlay:FindFirstChild("ErrorPrompt")
+		if prompt and prompt:IsA("GuiObject") then prompt.Visible = false end
+	end)
+end
+
 local SOFT_FAILS = {
 	[Enum.TeleportResult.GameFull] = true,
 	[Enum.TeleportResult.GameEnded] = true,
@@ -1261,6 +1375,8 @@ table.insert(connections, TeleportService.TeleportInitFailed:Connect(function(pl
 	if player ~= LocalPlayer then return end
 	local resultName = result and result.Name or "?"
 	warn("[EggHunter] TeleportInitFailed:", resultName, message)
+	lastInitFailAt = os.clock()
+	if C.AUTO_DISMISS_ERRORS then task.delay(0.4, dismissErrorPrompt) end
 
 	if result == Enum.TeleportResult.IsTeleporting then
 		UI.setHop("Ya hay un teleport en curso, espero...", THEME.Warn)
@@ -1285,6 +1401,30 @@ table.insert(connections, TeleportService.TeleportInitFailed:Connect(function(pl
 	end
 
 	UI.setHop(string.format("Teleport falló (%s), reintento en %ds", resultName, wait), THEME.Warn)
+	hopRetryAt = os.clock() + wait
+	hopping = false
+end))
+
+-- Respaldo: a veces el error (768-775, p. ej. 769) llega solo como cartel, sin TeleportInitFailed
+table.insert(connections, GuiService.ErrorMessageChanged:Connect(function()
+	local okC, code = pcall(function() return GuiService:GetErrorCode().Value end)
+	if not okC or code < 768 or code > 775 then return end
+	warn("[EggHunter] Error de teleport en pantalla:", code)
+	if C.AUTO_DISMISS_ERRORS then task.delay(0.4, dismissErrorPrompt) end
+
+	-- Si TeleportInitFailed ya lo manejó, no cuento el fallo dos veces
+	if os.clock() - lastInitFailAt < 3 then return end
+	-- Si no estaba saltando yo, no es asunto mío
+	if not hopping and os.clock() - lastTeleportAt > C.TELEPORT_WAIT then return end
+
+	if currentTarget then
+		badServers[currentTarget] = os.clock()
+		releaseServer(currentTarget)
+	end
+	teleportFails += 1
+	fastRetry = true
+	local wait = math.min(1 + 2 * teleportFails, 15)
+	UI.setHop(string.format("Error de teleport (%d), reintento en %ds", code, wait), THEME.Warn)
 	hopRetryAt = os.clock() + wait
 	hopping = false
 end))
@@ -1347,17 +1487,24 @@ task.spawn(function()
 
 		if scanRevision ~= confirmedScanRevision then
 			confirmedScanRevision = scanRevision
-			local rareNow = scannedOnce and (os.clock() - lastScan.at) < 25 and hasRareHere()
-			if rareNow then rareConfirmCount += 1 else rareConfirmCount = 0 end
+			local fresh = scannedOnce and (os.clock() - lastScan.at) < 25
+			if fresh and hasRareHere() then
+				rareConfirmCount += 1
+				dryCount = 0
+			else
+				rareConfirmCount = 0
+				if fresh then dryCount += 1 end
+			end
 		end
 		local rareConfirmed = rareConfirmCount >= 2 and scannedOnce
 			and (os.clock() - lastScan.at) < 25 and hasRareHere()
+		local dryConfirmed = C.HOP_WHEN_DRY and not rareConfirmed
+			and dryCount >= C.DRY_SCANS_NEEDED and scannedOnce
 
 		if rareConfirmed then
 			state.huntLastRare = now
 			if not state.huntActive and not stale then
 				state.huntActive = true
-				state.huntDry = 0
 				saveState()
 				print("[EggHunter] Raro CONFIRMADO → cacería activa")
 			end
@@ -1389,22 +1536,27 @@ task.spawn(function()
 
 		elseif stale then
 			hopAt, hopCap = nil, nil
+			dryCount = 0
 			UI.setHop(string.format("Descansando: nuevos huevos en %ds", math.ceil(C.CYCLE_SECONDS - phase)), THEME.Gold)
 
-		elseif rareConfirmed then
+		elseif rareConfirmed or dryConfirmed then
 			local filling, fillN = fillStatus()
 
 			if filling then
 				hopAt = nil
+				dryCount = 0
 				UI.setHop(string.format("Esperando huevos nuevos: %d/%d", fillN or 0, C.EXPECTED_EGGS), THEME.Cyan)
+			elseif rareConfirmed and C.HOLD_IF_ALONE and #Players:GetPlayers() <= 1 then
+				hopAt, hopCap = nil, nil
+				UI.setHop("¡Raro aquí! Estoy solo: me quedo para que el link siga vivo", THEME.Gold)
 			else
 				if not hopAt then
-					local base = fastRetry and 1 or C.HOP_DELAY_SECONDS
+					local base = fastRetry and 1 or (rareConfirmed and C.HOP_DELAY_SECONDS or C.DRY_HOP_DELAY)
 					local jitter = math.random() * (C.HOP_JITTER or 0)
 					hopAt = os.clock() + base + jitter
 					hopCap = hopAt + C.NOTIFY_HOP_GRACE
 				end
-				if sending or isLoading or hasPendingNotify() then
+				if rareConfirmed and (sending or isLoading or hasPendingNotify()) then
 					hopAt = math.min(math.max(hopAt, os.clock() + 2), hopCap)
 				end
 
@@ -1414,20 +1566,24 @@ task.spawn(function()
 				if left > 0 then
 					local windowLeft = phase and math.max(0, math.ceil(C.SEARCH_WINDOW - phase)) or nil
 					UI.setHop(
-						string.format("¡Raro aquí! Saltando en %ds%s", left,
-							windowLeft and (" • ventana: " .. windowLeft .. "s") or ""),
-						THEME.Gold
+						string.format(rareConfirmed and "¡Raro aquí! Saltando en %ds%s" or "Sin raro aquí • saltando en %ds%s",
+							left, windowLeft and (" • ventana: " .. windowLeft .. "s") or ""),
+						rareConfirmed and THEME.Gold or THEME.Cyan
 					)
 				else
 					hopAt, hopCap = nil, nil
-					print("[EggHunter] Salto porque hay raro confirmado en esta sala")
+					dryCount = 0
+					print(rareConfirmed and "[EggHunter] Salto: raro confirmado en esta sala"
+						or "[EggHunter] Salto: sala sin raros, sigo buscando")
 					hopServer()
 				end
 			end
 
 		else
 			hopAt, hopCap = nil, nil
-			if phase then
+			if C.HOP_WHEN_DRY then
+				UI.setHop(string.format("Revisando este servidor (%d/%d)...", math.min(dryCount, C.DRY_SCANS_NEEDED), C.DRY_SCANS_NEEDED), THEME.Muted)
+			elseif phase then
 				UI.setHop(string.format("Sin raro aquí • no salta • reinicio en %ds", math.ceil(C.CYCLE_SECONDS - phase)), THEME.Muted)
 			else
 				UI.setHop("Sin raro aquí • esperando (no salta)", THEME.Muted)
@@ -1453,7 +1609,8 @@ UI.onAutoHop = function()
 	saveState()
 	applyHopState()
 	if state.autoHop then
-		UI.setHop("Salto automático activado: solo salta si hay raro aquí", THEME.Green)
+		UI.setHop(C.HOP_WHEN_DRY and "Salto automático activado: busca servidores con raros"
+			or "Salto automático activado: solo salta si hay raro aquí", THEME.Green)
 	end
 end
 
@@ -1473,7 +1630,8 @@ applyHopState()
 UI.setSort(sortIndex)
 
 if state.autoHop then
-	UI.setHop("Salto automático activado: solo salta si hay raro aquí", THEME.Green)
+	UI.setHop(C.HOP_WHEN_DRY and "Salto automático activado: busca servidores con raros"
+		or "Salto automático activado: solo salta si hay raro aquí", THEME.Green)
 end
 
 task.delay(0.8, loadEggs)
